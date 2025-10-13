@@ -1,0 +1,17 @@
+[workspace]
+members = [ ".", "macros" ]
+
+[workspace.dependencies]
+macros = { path = "macros" }
+
+[package]
+name = "server2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ustr = { version = "1.1.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_with = "3.15.0"
+macros.workspace = true
