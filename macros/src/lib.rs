@@ -44,7 +44,7 @@ pub fn derive_diffs(input: TokenStream) -> TokenStream {
             });
             let apply_fn = format_ident!("apply_{}", name.to_string().to_snake_case());
             return TokenStream::from(quote!(
-                #[derive(Clone, Debug, PartialOrd, PartialEq, Eq, Hash, Serialize, Deserialize)]
+                #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
                 pub enum #name {
                     #(#variants),*
                 }
