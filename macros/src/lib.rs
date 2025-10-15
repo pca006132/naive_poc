@@ -48,7 +48,7 @@ pub fn derive_diffs(input: TokenStream) -> TokenStream {
                 pub enum #name {
                     #(#variants),*
                 }
-                fn #apply_fn(obj: &mut #owner, diff: #name) {
+                pub fn #apply_fn(obj: &mut #owner, diff: #name) {
                     match diff {
                         #(#match_arm),*
                     }

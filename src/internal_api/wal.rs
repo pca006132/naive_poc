@@ -1,4 +1,4 @@
-use super::common::UserId;
+use super::UserId;
 use serde::Serialize;
 use serde_json::to_string;
 use std::sync::Mutex;
