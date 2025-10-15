@@ -23,6 +23,9 @@ use ustr::Ustr;
 pub struct ArtistId(usize);
 
 #[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UserId(usize);
+
+#[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReleaseId(usize);
 
 #[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -92,7 +95,7 @@ pub struct ArtistMembership {
 // for documents, we implement update manually (diff it)
 
 #[skip_serializing_none]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, DiffFields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, DiffFields, Default)]
 pub struct ArtistMetaData {
     pub name: String,
     pub aliases: LinearSet<StringWithLocal>,
@@ -105,6 +108,8 @@ pub struct ArtistMetaData {
     pub birthyear: Option<u16>,
     pub urls: LinearSet<Url>,
 
+    #[skip_diff]
+    pub seq_id: u64,
     #[skip_diff]
     pub profile_image: Option<Image>,
     #[skip_diff]
@@ -135,12 +140,12 @@ pub struct Song {
 
 // for query, also return artist -> name mapping, and simple song metadata
 #[skip_serializing_none]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, DiffFields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, DiffFields, Default)]
 pub struct Release {
-    pub album_artists: LinearSet<ArtistId>,
-    pub release_kind: ReleaseKind,
     pub title: String,
+    pub release_kind: Option<ReleaseKind>,
     pub catalog_num: Option<String>,
+    pub album_artists: LinearSet<ArtistId>,
     pub cover_art: Option<Image>,
     pub credits: LinearSet<(ArtistId, ArtistRole)>,
     pub disc_names: Vec<String>,
@@ -148,6 +153,8 @@ pub struct Release {
     pub release_date: Option<DateWithPrecision>,
     pub urls: LinearSet<Url>,
 
+    #[skip_diff]
+    pub seq_id: u64,
     #[skip_diff]
     pub localized_titles: LocalizedStrings,
     #[skip_diff]
@@ -160,14 +167,33 @@ pub struct Release {
     pub descriptions: LocalizedDocuments,
 }
 
+#[skip_serializing_none]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, DiffFields, Default)]
+pub struct Event {
+    pub name: String,
+    pub location: Option<LocationId>,
+    pub address: String,
+    pub start_date: Option<DateWithPrecision>,
+    pub end_date: Option<DateWithPrecision>,
+    pub urls: LinearSet<Url>,
+
+    #[skip_diff]
+    pub seq_id: u64,
+    #[skip_diff]
+    pub localized_names: LocalizedStrings,
+    #[skip_diff]
+    pub descriptions: LocalizedDocuments,
+}
+
 pub struct States {
-    pub artists: RwLock<Vec<RwLock<ArtistMetaData>>>,
-    pub releases: RwLock<Vec<RwLock<Release>>>,
+    artists: RwLock<Vec<RwLock<ArtistMetaData>>>,
+    releases: RwLock<Vec<RwLock<Release>>>,
+    events: RwLock<Vec<RwLock<Event>>>,
 
     // derived
-    pub group_members: RwLock<BTreeMap<ArtistId, Vec<ArtistId>>>,
-    pub artist_discography: RwLock<BTreeMap<ArtistId, Vec<TrackRef>>>,
-    pub derived_songs: RwLock<BTreeMap<TrackRef, Vec<(TrackRef, SongRelationKind)>>>,
+    group_members: RwLock<BTreeMap<ArtistId, Vec<ArtistId>>>,
+    artist_discography: RwLock<BTreeMap<ArtistId, Vec<TrackRef>>>,
+    derived_songs: RwLock<BTreeMap<TrackRef, Vec<(TrackRef, SongRelationKind)>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +205,8 @@ pub enum InternalErr {
     InvalidReleaseId(ReleaseId),
     InvalidTrackRef(TrackRef),
     Poisoned,
+    OutdatedUpdate,
+    InvalidRelation,
     Other(String),
 }
 
@@ -189,25 +217,58 @@ impl<T> From<PoisonError<T>> for InternalErr {
 }
 
 impl States {
-    pub fn artist_add(&self, metadata: ArtistMetaData) -> Result<ArtistId, InternalErr> {
-        // TODO: validation
+    pub fn artist_add(&self, name: String) -> Result<ArtistId, InternalErr> {
+        let artist = ArtistMetaData {
+            name,
+            seq_id: 0,
+            ..Default::default()
+        };
         let mut artists = self.artists.write()?;
-        artists.push(RwLock::new(metadata));
+        artists.push(RwLock::new(artist));
         Ok(ArtistId(artists.len() - 1))
+    }
+
+    pub fn release_add(&self, title: String) -> Result<ReleaseId, InternalErr> {
+        let release = Release {
+            title,
+            seq_id: 0,
+            ..Default::default()
+        };
+        let mut releases = self.releases.write()?;
+        releases.push(RwLock::new(release));
+        Ok(ReleaseId(releases.len() - 1))
+    }
+
+    pub fn event_add(&self, name: String) -> Result<EventId, InternalErr> {
+        let event = Event {
+            name,
+            seq_id: 0,
+            ..Default::default()
+        };
+        let mut events = self.events.write()?;
+        events.push(RwLock::new(event));
+        Ok(EventId(events.len() - 1))
     }
 
     pub fn artist_metadata_update(
         &self,
         id: ArtistId,
         diff: ArtistMetaDataDiff,
+        seq_id: u64,
     ) -> Result<(), InternalErr> {
         let artists = self.artists.read()?;
         if id.0 >= artists.len() {
             return Err(InternalErr::InvalidArtistId(id));
         }
         let mut artist = artists[id.0].write()?;
+
+        // enforce sequential update for each artist metadata
+        if artist.seq_id != seq_id {
+            return Err(InternalErr::OutdatedUpdate);
+        }
+        artist.seq_id += 1;
+
         apply_artist_meta_data_diff(&mut artist, diff);
-        // TODO: further updates
         Ok(())
     }
 }
