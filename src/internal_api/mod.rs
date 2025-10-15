@@ -1,4 +1,5 @@
 pub mod common;
+pub mod wal;
 
 // Internal API structs
 //
@@ -10,20 +11,18 @@ pub mod common;
 // them directly in the user-facing APIs.
 
 use common::*;
-use linear_map::{set::LinearSet, LinearMap};
+use wal::LogStore;
 use macros::DiffFields;
+use safe_mix::triplet_mix;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::{PoisonError, RwLock};
 use std::vec::Vec;
 use ustr::Ustr;
 
 #[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArtistId(usize);
-
-#[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct UserId(usize);
 
 #[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReleaseId(usize);
@@ -91,14 +90,11 @@ pub struct ArtistMembership {
     pub end_date: Option<DateWithPrecision>,
 }
 
-// proc macro to generate per field update enum, but allow exclusion
-// for documents, we implement update manually (diff it)
-
 #[skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, DiffFields, Default)]
 pub struct ArtistMetaData {
     pub name: String,
-    pub aliases: LinearSet<StringWithLocal>,
+    pub aliases: Vec<StringWithLocal>,
     pub kind: Option<ArtistKind>,
     pub start_loc: Option<LocationId>,
     pub current_loc: Option<LocationId>,
@@ -106,32 +102,31 @@ pub struct ArtistMetaData {
     pub end_date: Option<DateWithPrecision>,
     pub birthday: Option<Birthday>,
     pub birthyear: Option<u16>,
-    pub urls: LinearSet<Url>,
+    pub urls: Vec<Url>,
 
     #[skip_diff]
-    pub seq_id: u64,
+    pub seq_id: Hash128,
     #[skip_diff]
     pub profile_image: Option<Image>,
     #[skip_diff]
-    pub memberships: LinearSet<ArtistMembership>,
+    pub memberships: Vec<ArtistMembership>,
     #[skip_diff]
-    pub tags: LinearSet<TagId>,
+    pub tags: Vec<TagId>,
     #[skip_diff]
     pub descriptions: LocalizedDocuments,
 }
 
-// for query, also return artist -> name mapping
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, DiffFields)]
 pub struct Song {
     pub title: String,
-    pub artists: LinearSet<ArtistId>,
-    pub credits: LinearSet<(ArtistId, ArtistRole)>,
-    pub language: LinearSet<LocalId>,
-    pub originals: LinearMap<TrackRef, SongRelationKind>,
+    pub artists: Vec<ArtistId>,
+    pub credits: Vec<(ArtistId, ArtistRole)>,
+    pub language: Vec<LocalId>,
+    pub originals: Vec<(TrackRef, SongRelationKind)>,
     pub duration_s: Option<u32>,
 
     #[skip_diff]
-    pub tags: LinearSet<TagId>,
+    pub tags: Vec<TagId>,
     #[skip_diff]
     pub localized_titles: LocalizedStrings,
     #[skip_diff]
@@ -145,24 +140,24 @@ pub struct Release {
     pub title: String,
     pub release_kind: Option<ReleaseKind>,
     pub catalog_num: Option<String>,
-    pub album_artists: LinearSet<ArtistId>,
+    pub album_artists: Vec<ArtistId>,
     pub cover_art: Option<Image>,
-    pub credits: LinearSet<(ArtistId, ArtistRole)>,
+    pub credits: Vec<(ArtistId, ArtistRole)>,
     pub disc_names: Vec<String>,
     pub event: Option<EventId>,
     pub release_date: Option<DateWithPrecision>,
-    pub urls: LinearSet<Url>,
+    pub urls: Vec<Url>,
 
     #[skip_diff]
-    pub seq_id: u64,
+    pub seq_id: Hash128,
     #[skip_diff]
     pub localized_titles: LocalizedStrings,
     #[skip_diff]
-    pub tracks: LinearMap<TrackNum, Song>,
+    pub tracks: HashMap<TrackNum, Song>,
     #[skip_diff]
-    pub tags: LinearSet<TagId>,
+    pub tags: Vec<TagId>,
     #[skip_diff]
-    pub images: LinearSet<Image>,
+    pub images: Vec<Image>,
     #[skip_diff]
     pub descriptions: LocalizedDocuments,
 }
@@ -175,25 +170,27 @@ pub struct Event {
     pub address: String,
     pub start_date: Option<DateWithPrecision>,
     pub end_date: Option<DateWithPrecision>,
-    pub urls: LinearSet<Url>,
+    pub urls: Vec<Url>,
 
     #[skip_diff]
-    pub seq_id: u64,
+    pub seq_id: Hash128,
     #[skip_diff]
     pub localized_names: LocalizedStrings,
     #[skip_diff]
     pub descriptions: LocalizedDocuments,
 }
 
-pub struct States {
+pub struct States<'a, L: LogStore> {
+    wal: &'a L,
+
     artists: RwLock<Vec<RwLock<ArtistMetaData>>>,
     releases: RwLock<Vec<RwLock<Release>>>,
     events: RwLock<Vec<RwLock<Event>>>,
 
     // derived
-    group_members: RwLock<BTreeMap<ArtistId, Vec<ArtistId>>>,
-    artist_discography: RwLock<BTreeMap<ArtistId, Vec<TrackRef>>>,
-    derived_songs: RwLock<BTreeMap<TrackRef, Vec<(TrackRef, SongRelationKind)>>>,
+    group_members: RwLock<HashMap<ArtistId, Vec<ArtistId>>>,
+    artist_discography: RwLock<HashMap<ArtistId, Vec<TrackRef>>>,
+    derived_songs: RwLock<HashMap<TrackRef, Vec<(TrackRef, SongRelationKind)>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,46 +213,58 @@ impl<T> From<PoisonError<T>> for InternalErr {
     }
 }
 
-impl States {
-    pub fn artist_add(&self, name: String) -> Result<ArtistId, InternalErr> {
+impl From<String> for InternalErr {
+    fn from(s: String) -> InternalErr {
+        InternalErr::Other(s)
+    }
+}
+
+impl<'a, L: LogStore> States<'a, L> {
+    pub fn artist_add(&self, user: UserId, name: String) -> Result<ArtistId, InternalErr> {
         let artist = ArtistMetaData {
             name,
-            seq_id: 0,
+            seq_id: Hash128(0),
             ..Default::default()
         };
         let mut artists = self.artists.write()?;
+        self.wal.record(user, "artist_add", &artist)?;
         artists.push(RwLock::new(artist));
         Ok(ArtistId(artists.len() - 1))
     }
 
-    pub fn release_add(&self, title: String) -> Result<ReleaseId, InternalErr> {
+    pub fn release_add(&self, user: UserId, title: String) -> Result<ReleaseId, InternalErr> {
         let release = Release {
             title,
-            seq_id: 0,
+            seq_id: Hash128(0),
             ..Default::default()
         };
         let mut releases = self.releases.write()?;
+        self.wal.record(user, "release_add", &release)?;
         releases.push(RwLock::new(release));
         Ok(ReleaseId(releases.len() - 1))
     }
 
-    pub fn event_add(&self, name: String) -> Result<EventId, InternalErr> {
+    pub fn event_add(&self, user: UserId, name: String) -> Result<EventId, InternalErr> {
         let event = Event {
             name,
-            seq_id: 0,
+            seq_id: Hash128(0),
             ..Default::default()
         };
         let mut events = self.events.write()?;
+        self.wal.record(user, "event_add", &event)?;
         events.push(RwLock::new(event));
         Ok(EventId(events.len() - 1))
     }
 
     pub fn artist_metadata_update(
         &self,
+        user: UserId,
         id: ArtistId,
         diff: ArtistMetaDataDiff,
-        seq_id: u64,
-    ) -> Result<(), InternalErr> {
+        mut seq_id: Hash128,
+        update_seq_id: bool,
+    ) -> Result<Hash128, InternalErr> {
+        let hash = get_hash(&diff);
         let artists = self.artists.read()?;
         if id.0 >= artists.len() {
             return Err(InternalErr::InvalidArtistId(id));
@@ -266,9 +275,13 @@ impl States {
         if artist.seq_id != seq_id {
             return Err(InternalErr::OutdatedUpdate);
         }
-        artist.seq_id += 1;
+        if update_seq_id {
+            seq_id = Hash128(triplet_mix(&[seq_id.0, hash.0]).unwrap());
+            artist.seq_id = seq_id;
+        }
+        self.wal.record(user, "artist_metadata_update", &diff)?;
 
         apply_artist_meta_data_diff(&mut artist, diff);
-        Ok(())
+        Ok(seq_id)
     }
 }
